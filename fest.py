@@ -21,8 +21,7 @@ Methodology:
 
 
 
-Author: Research Team
-Publication Context: Q1 Journal Submission
+Author: Pietro Grassi
 Date: February 2026
 """
 
