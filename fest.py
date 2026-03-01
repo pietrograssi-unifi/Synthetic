@@ -22,6 +22,7 @@ Methodology:
 
 
 Author: Pietro Grassi
+Publication Context: Q1 Journal Submission
 Date: February 2026
 """
 
@@ -347,9 +348,9 @@ def main():
 
     # 2. Load Synthetic Candidates
     candidate_files = {
-        'CTGAN': 'Augmented_CTGAN.csv',
-        'TVAE': 'Augmented_TVAE.csv',
-        'TTVAE': 'Augmented_TTVAE.csv'
+        'CTGAN': 'Augmented_v1new_CTGAN.csv',
+        'TVAE': 'Augmented_v1new_TVAE.csv',
+        'TTVAE': 'Augmented_v1new_TTVAE.csv'
     }
     
     models_data = {}
@@ -419,7 +420,7 @@ def main():
         print(f"   Reasoning: Highest marginal fidelity score (KS = {winner['KS Score (Fidelity)']:.4f})")
 
     # 6. Visualization
-    target_col = 'maxgrip' 
+    target_col = 'eurod_imp' 
     if target_col not in real_df.columns:
         numerics = real_df.select_dtypes(include=np.number).columns
         if len(numerics) > 0:
