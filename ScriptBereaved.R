@@ -1,0 +1,978 @@
+# ==============================================================================
+# TITLE:   Replication Script for: Synthesizing the Counterfactual: 
+#          A CTGAN-Augmented Causal Evaluation of Palliative Care
+# DATA:    Survey of Health, Ageing and Retirement in Europe (SHARE)
+# AUTHORS: Pietro Grassi, Chiara Seghieri, Daniele Vignoli, Roberto Molinari
+# DATE:    March 2026
+# ==============================================================================
+
+# ==============================================================================
+# 0. CONFIGURATION & ENVIRONMENT SETUP
+# ==============================================================================
+rm(list = ls())
+gc()
+set.seed(2026)
+
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(
+  tidyverse, haven, stringr, janitor,
+  fixest, plm, MatchIt, cobalt, ggplot2, modelsummary, broom,
+  synthdid, future, furrr
+)
+
+pak::pak("synth-inference/synthdid")
+
+# --- DIRECTORY MANAGEMENT ---
+# Modify PATH_DATA to point to the local SHARE dataset repository.
+PATH_DATA <- "/Users/pietro/Desktop/Sant'Anna/Ricerca/SHARE/DatiDid" 
+PATH_OUT  <- "/Users/pietro/Desktop/Sant'Anna/Ricerca/SHARE/DiDRev2"
+
+if(!dir.exists(PATH_OUT)) dir.create(PATH_OUT, recursive = TRUE)
+
+
+# ==============================================================================
+# 1. IMPORT UTILITY FUNCTION
+# ==============================================================================
+#' Iterates through longitudinal files for a specific SHARE module,
+#' selects and renames variables based on a mapping dictionary, and binds them.
+#' 
+#' @param path Directory containing the SHARE .dta files.
+#' @param module_code The specific module abbreviation (e.g., "xt", "ph").
+#' @param var_mapping A named character vector mapping standardized names to SHARE regex.
+read_share_module <- function(path, module_code, var_mapping) {
+  
+  pattern_file <- paste0("sharew.*_", module_code, ".dta")
+  files <- list.files(path, pattern = pattern_file, full.names = TRUE, recursive = TRUE)
+  
+  if(length(files) == 0) {
+    warning(paste("Data Import Warning: No files found for module:", module_code))
+    return(tibble())
+  }
+  
+  message(sprintf("[Import] Processing %d files for module: %s", length(files), module_code))
+  
+  data_list <- map(files, function(f) {
+    filename <- basename(f)
+    wave_num <- as.numeric(str_extract(str_extract(filename, "sharew\\d+"), "\\d+"))
+    
+    headers <- names(read_dta(f, n_max = 0))
+    selected_cols <- c("mergeid") 
+    rename_vec <- c()             
+    
+    for (new_name in names(var_mapping)) {
+      pattern <- var_mapping[[new_name]]
+      matches <- headers[str_detect(headers, paste0("^", pattern))]
+      
+      if (length(matches) > 0) {
+        col_found <- matches[1] 
+        selected_cols <- c(selected_cols, col_found)
+        rename_vec[new_name] <- col_found
+      }
+    }
+    
+    d <- read_dta(f, col_select = any_of(selected_cols))
+    if (length(rename_vec) > 0) d <- d %>% rename(!!!rename_vec)
+    
+    # Ensure structural consistency across waves by padding missing columns
+    missing_vars <- setdiff(names(var_mapping), names(d))
+    for (mv in missing_vars) d[[mv]] <- NA
+    
+    d <- d %>% mutate(mergeid = as.character(mergeid), wave = wave_num)
+    return(d)
+  })
+  
+  final_df <- bind_rows(data_list) %>% distinct(mergeid, wave, .keep_all = TRUE) 
+  return(final_df)
+}
+
+
+# ==============================================================================
+# 2. VARIABLE DICTIONARIES (MAPPINGS)
+# ==============================================================================
+
+# Module XT: End of Life (Treatment Assignment & Mortality)
+map_xt <- c(
+  "treated_palliat" = "xt757", 
+  "cause_death"     = "xt011", 
+  "reason_no_care"  = "xt754",
+  "country"         = "country", 
+  "symptoms_pain"   = "xt758", 
+  "symptoms_breath" = "xt760", 
+  "symptoms_anx"    = "xt762"
+)
+
+# Module PH: Physical Health (Chronic Conditions)
+map_ph <- c(
+  "ph006_1"  = "ph006_1",  "ph006d1"  = "ph006d1",   # Heart Attack
+  "ph006_4"  = "ph006_4",  "ph006d4"  = "ph006d4",   # Hypertension
+  "ph006_6"  = "ph006_6",  "ph006d6"  = "ph006d6",   # Stroke
+  "ph006_10" = "ph006_10", "ph006d10" = "ph006d10",  # Cancer
+  "ph006_12" = "ph006_12", "ph006d12" = "ph006d12",  # Stomach/Duodenal Ulcer
+  "ph006_16" = "ph006_16", "ph006d16" = "ph006d16",  # Parkinson/Alzheimer
+  "ph006_21" = "ph006_21", "ph006d21" = "ph006d21"   # Chronic Kidney Disease
+)
+
+# Demographic & Environmental Covariates
+map_cv <- c("gender" = "gender", "yrbirth" = "yrbirth", "coupleid" = "coupleid", "int_year" = "int_year")
+map_mh <- c("eurod" = "eurod")                      # Mental Health Outcome
+map_iv <- c("area_iv" = "iv009")                    # Interviewer observations
+map_hh <- c("area_move" = "ho037")                  # Household location
+map_hc <- c("health_sat" = "hc125", "ins_sat" = "hc113") 
+map_dn <- c("partner_id" = "dn014")                 # Social Network
+
+# Imputations (gv_imputations generated by SHARE)
+map_imp <- c(
+  "wealth_imp"  = "hnetw", 
+  "income_imp"  = "thinc2", 
+  "adl_imp"     = "adl", 
+  "sphus_imp"   = "sphus",
+  "age_imp"     = "age", 
+  "gender_imp"  = "gender", 
+  "edu_imp"     = "isced", 
+  "eurod_imp"   = "eurod", 
+  "maxgrip_imp" = "maxgrip"
+)
+
+
+# ==============================================================================
+# 3. DATA IMPORT EXECUTION
+# ==============================================================================
+message("[Pipeline] Stage 1: Raw Data Ingestion")
+
+df_xt  <- read_share_module(PATH_DATA, "xt", map_xt)
+df_ph  <- read_share_module(PATH_DATA, "ph", map_ph)
+df_mh  <- read_share_module(PATH_DATA, "gv_health", map_mh) 
+df_cv  <- read_share_module(PATH_DATA, "cv_r", map_cv) 
+df_hh  <- read_share_module(PATH_DATA, "ho", map_hh)
+df_iv  <- read_share_module(PATH_DATA, "iv", map_iv)
+df_hc  <- read_share_module(PATH_DATA, "hc", map_hc)
+df_dn  <- read_share_module(PATH_DATA, "dn", map_dn)
+df_imp <- read_share_module(PATH_DATA, "gv_imputations", map_imp)
+
+
+# ==============================================================================
+# 4. DYADIC LINKAGE ALGORITHM
+# ==============================================================================
+# Objective: Link the proxy end-of-life interview of the decedent to the 
+# longitudinal trajectory of the surviving spouse via household identifiers.
+# ==============================================================================
+message("[Pipeline] Stage 2: Dyadic Linkage")
+
+# 4.1. Clean and Propagate Household Identifiers
+# Forward-fill 'coupleid' to prevent linkage failure due to missingness in later waves.
+df_cv_clean <- df_cv %>%
+  arrange(mergeid, wave) %>%
+  group_by(mergeid) %>%
+  mutate(
+    coupleid = as.character(coupleid),
+    coupleid = na_if(coupleid, ""),
+    coupleid = if_else(coupleid == "0", NA_character_, coupleid)
+  ) %>%
+  fill(coupleid, .direction = "down") %>%
+  ungroup() %>%
+  filter(!is.na(coupleid))
+
+# 4.2. Define Treatment Cohort (Decedents)
+deceased_xt <- df_xt %>%
+  rename(wave_death = wave) %>%
+  mutate(
+    # Consolidate palliative care reception across survey versions
+    raw_pall = coalesce(
+      if("treated_palliat" %in% names(.)) as.numeric(treated_palliat) else NULL,
+      if("xt021" %in% names(.)) as.numeric(xt021) else NULL
+    ),
+    # Treatment Assignment (1 = Palliative Care, 0 = Standard Care)
+    is_treated = case_when(
+      raw_pall == 1 ~ 1,      
+      raw_pall %in% c(0,5) ~ 0, 
+      TRUE ~ NA_real_
+    ),
+    # Eligibility restriction for the control group to mitigate confounding by indication
+    reason_code = as.numeric(reason_no_care),
+    control_eligible = if_else(is_treated == 0 & reason_code %in% c(2, 3), 1, 0)
+  ) %>%
+  filter(!is.na(is_treated)) %>%
+  select(deceased_id = mergeid, wave_death, is_treated, control_eligible, cause_death, country) 
+
+# 4.3. Execute Dyadic Matching
+# Extract the last known couple ID for the deceased prior to death
+deceased_history <- df_cv_clean %>%
+  inner_join(deceased_xt %>% select(deceased_id, wave_death), by = c("mergeid" = "deceased_id")) %>%
+  filter(wave < wave_death) %>%
+  arrange(mergeid, desc(wave)) %>%
+  group_by(mergeid) %>%
+  slice(1) %>% 
+  ungroup() %>%
+  select(deceased_id = mergeid, last_wave = wave, coupleid_key = coupleid)
+
+# Match with the surviving partner using the historical couple ID
+partners_found <- df_cv_clean %>%
+  inner_join(deceased_history, by = c("coupleid" = "coupleid_key", "wave" = "last_wave")) %>%
+  filter(mergeid != deceased_id) %>% 
+  rename(partner_id = mergeid) %>%
+  select(partner_id, deceased_id)
+
+dyad_map <- partners_found %>%
+  inner_join(deceased_xt, by = "deceased_id")
+
+# 4.4. Resolve Linkage Ambiguities
+# Exclude dyads with simultaneous mortality to cleanly isolate the bereavement effect.
+double_deaths <- dyad_map %>%
+  group_by(partner_id, wave_death) %>%
+  filter(n() > 1) %>%
+  pull(deceased_id)
+
+dyad_map_clean <- dyad_map %>%
+  filter(!deceased_id %in% double_deaths)
+
+message(sprintf("[Linkage] Complete. Valid Dyads Identified: %d", nrow(dyad_map_clean)))
+
+# ==============================================================================
+# 5. LONGITUDINAL PANEL CONSTRUCTION (SURVIVOR-CENTERED)
+# ==============================================================================
+message("[Pipeline] Stage 3: Survivor Panel Construction & Variable Engineering")
+
+# Merge modules based on the survivor identifier
+survivor_panel <- df_imp %>% 
+  rename(survivor_id = mergeid) %>%
+  inner_join(dyad_map_clean, by = c("survivor_id" = "partner_id")) %>%
+  left_join(df_ph, by = c("survivor_id" = "mergeid", "wave")) %>%
+  left_join(df_iv, by = c("survivor_id" = "mergeid", "wave")) %>%
+  left_join(df_hh, by = c("survivor_id" = "mergeid", "wave")) %>%
+  left_join(df_hc, by = c("survivor_id" = "mergeid", "wave")) %>%
+  left_join(df_cv %>% select(mergeid, wave, int_year), by = c("survivor_id" = "mergeid", "wave"))
+
+# Helper for robust numeric extraction across varying module structures
+safe_chk <- function(col_name, df) {
+  if(col_name %in% names(df)) return(as.numeric(df[[col_name]]))
+  return(rep(NA_real_, nrow(df)))
+}
+
+df_analysis <- survivor_panel %>%
+  
+  # Structural Variables Interpolation
+  mutate(temp_area = coalesce(as.numeric(area_iv), as.numeric(area_move))) %>%
+  group_by(survivor_id) %>%
+  fill(temp_area, .direction = "downup") %>%
+  ungroup() %>%
+  
+  mutate(
+    int_year = as.numeric(int_year), 
+    int_year = if_else(int_year < 0, NA_real_, int_year),
+    temp_death_year = if_else(wave == wave_death, int_year, NA_real_)
+  ) %>%
+  group_by(survivor_id) %>%
+  fill(temp_death_year, .direction = "downup") %>%
+  ungroup() %>%
+  rename(death_year = temp_death_year) %>%
+  
+  # Variable Engineering
+  mutate(
+    # Event-Time Specification (t=0 set at wave of death)
+    rel_time = wave - wave_death,
+    
+    # Primary Outcome
+    dep_score = as.numeric(eurod_imp), 
+    
+    # Causal Treatment Assignment
+    treat_group = case_when(
+      is_treated == 1 ~ 1,
+      control_eligible == 1 ~ 0,
+      TRUE ~ NA_real_
+    ),
+    
+    # Base Demographics
+    age = as.numeric(age_imp),          
+    is_female = if_else(as.numeric(gender_imp) == 2, 1, 0), 
+    
+    edu_level = factor(case_when(
+      as.numeric(edu_imp) <= 2 ~ "Low",     
+      as.numeric(edu_imp) <= 4 ~ "Medium", 
+      TRUE ~ "High"
+    ), levels = c("Low", "Medium", "High")),
+    
+    # Economic Status (Inverse Hyperbolic Sine to handle right-skewness and zeros)
+    wealth_log = asinh(as.numeric(wealth_imp)), 
+    
+    # Physical Health Measures
+    adl_raw = suppressWarnings(as.numeric(adl_imp)),
+    adl_score = if_else(adl_raw < 0, NA_real_, adl_raw),
+    
+    maxgrip_raw = suppressWarnings(as.numeric(maxgrip_imp)),
+    maxgrip = if_else(maxgrip_raw > 100 | maxgrip_raw < 0, NA_real_, maxgrip_raw),
+    
+    # Comorbidity Extraction
+    p_ca_10 = safe_chk("ph006_10", .), p_cad_10 = safe_chk("ph006d10", .), 
+    p_ne_16 = safe_chk("ph006_16", .), p_ned_16 = safe_chk("ph006d16", .), 
+    p_ne_12 = safe_chk("ph006_12", .), p_ned_12 = safe_chk("ph006d12", .), 
+    p_or_1  = safe_chk("ph006_1", .),  p_ord_1  = safe_chk("ph006d1", .),  
+    p_or_4  = safe_chk("ph006_4", .),  p_ord_4  = safe_chk("ph006d4", .),  
+    p_or_6  = safe_chk("ph006_6", .),  p_ord_6  = safe_chk("ph006d6", .),  
+    p_or_21 = safe_chk("ph006_21", .), p_ord_21 = safe_chk("ph006d21", .), 
+    
+    has_cancer = case_when(
+      (!is.na(p_ca_10) & p_ca_10 == 1) | (!is.na(p_cad_10) & p_cad_10 == 1) ~ 1, 
+      is.na(p_ca_10) & is.na(p_cad_10) ~ NA_real_,
+      TRUE ~ 0
+    ),
+    
+    has_neuro = case_when(
+      (!is.na(p_ne_16) & p_ne_16 == 1) | (!is.na(p_ned_16) & p_ned_16 == 1) | 
+        (!is.na(p_ned_12) & p_ned_12 == 1) ~ 1, 
+      TRUE ~ 0
+    ),
+    
+    has_organ = case_when(
+      (!is.na(p_or_1) & p_or_1 == 1) | (!is.na(p_ord_1) & p_ord_1 == 1) ~ 1, 
+      (!is.na(p_or_4) & p_or_4 == 1) | (!is.na(p_ord_4) & p_ord_4 == 1) ~ 1, 
+      (!is.na(p_or_6) & p_or_6 == 1) | (!is.na(p_ord_6) & p_ord_6 == 1) ~ 1,
+      (!is.na(p_or_21) & p_or_21 == 1) | (!is.na(p_ord_21) & p_ord_21 == 1) ~ 1,
+      TRUE ~ 0
+    ),
+    
+    # Categorical Environment and Satisfaction Variables
+    living_area_cat = factor(case_when(
+      temp_area %in% c(1, 2) ~ "Urban/City",
+      temp_area %in% c(3, 4) ~ "Town",
+      temp_area == 5 ~ "Rural"
+    ), levels = c("Urban/City", "Town", "Rural")),
+    
+    hc125_num = suppressWarnings(as.numeric(health_sat)),
+    satisfaction_health = factor(case_when(
+      hc125_num %in% c(1, 2) ~ "Satisfied",
+      hc125_num %in% c(3, 4) ~ "Dissatisfied"
+    ), levels = c("Satisfied", "Dissatisfied"))
+    
+  ) %>%
+  # Filter observation window to +/- 3 waves around the mortality event
+  filter(abs(rel_time) <= 3) %>%  
+  filter(!is.na(treat_group)) %>%
+  select(-starts_with("p_ca_"), -starts_with("p_ne_"), -starts_with("p_or_"), 
+         -starts_with("p_cad_"), -starts_with("p_ned_"), -starts_with("p_ord_")) %>%
+  arrange(survivor_id, wave)
+
+# Extract sample sizes before and after the confounding-by-indication filter
+n_control_pre <- survivor_panel %>% filter(is_treated == 0) %>% nrow()
+message(sprintf("[Diagnostics] Control units prior to eligibility filter: %d", n_control_pre))
+
+n_control_post <- survivor_panel %>% filter(control_eligible == 1) %>% nrow()
+message(sprintf("[Diagnostics] Control units post eligibility filter: %d", n_control_post))
+
+
+# ==============================================================================
+# 6. MISSING DATA IMPUTATION (MICE PRE-AUGMENTATION)
+# ==============================================================================
+# Imputes missing baseline and time-varying covariates prior to generative 
+# modeling. A Classification and Regression Trees (CART) approach within MICE 
+# is utilized to capture non-linearities and complex interactions.
+# ==============================================================================
+message("[Pipeline] Stage 4: Missing Data Imputation (MICE-CART)")
+
+pacman::p_load(mice, dplyr, haven, readr)
+
+# --- 6.1 Data Preparation & NA Injection ---
+# Convert survey-specific missingness codes to standard NA format, preserving
+# valid negative values in pre-imputed economic variables.
+vars_to_exclude_from_cleaning <- c(
+  "survivor_id", "deceased_id", "rel_time", 
+  "wealth_imp", "wealth_log", "income_imp"
+)
+
+df_clean <- df_analysis %>%
+  mutate(across(
+    .cols = -any_of(vars_to_exclude_from_cleaning) & where(is.numeric),
+    .fns = ~ if_else(.x %in% c(-99, -999, -2, -1), NA_real_, .x)
+  )) %>%
+  mutate(across(where(~ inherits(., "haven_labelled")), as.numeric)) %>% 
+  mutate(across(where(is.character), as.factor)) %>%
+  select(where(~ sum(!is.na(.)) > 0))
+
+message(sprintf("[Imputation] Total NA count pre-imputation: %d", sum(is.na(df_clean))))
+
+# --- 6.2 Configure MICE Architecture ---
+vars_with_missing <- names(which(colSums(is.na(df_clean)) > 0))
+
+init <- mice(df_clean, maxit = 0)
+meth <- init$method
+predM <- init$predictorMatrix
+
+# Exclude identifiers from the prediction matrix
+ids_to_ignore <- c("survivor_id", "deceased_id", "mergeid", "coupleid", "is_synthetic")
+for (var in names(df_clean)) {
+  if (var %in% ids_to_ignore) {
+    meth[var] <- ""
+    predM[, var] <- 0
+    predM[var, ] <- 0
+  }
+}
+
+meth[vars_with_missing] <- "cart"
+
+# --- 6.3 Execute MICE ---
+message("[Imputation] Executing CART imputation algorithm...")
+imp_obj <- mice(df_clean, 
+                method = meth, 
+                predictorMatrix = predM, 
+                m = 1,            # Single imputation for ML preprocessing
+                maxit = 5,        
+                seed = 123, 
+                printFlag = FALSE)
+
+df_imputed <- complete(imp_obj)
+
+n_missing_final <- sum(is.na(select(df_imputed, -any_of(ids_to_ignore))))
+if(n_missing_final > 0) {
+  warning(sprintf("[Imputation] %d missing values remain post-MICE.", n_missing_final))
+}
+
+# --- 6.4 Export Analytical Base for Generative Pipeline ---
+# FORZIAMO IL SEED PER LA RIPRODUCIBILITA' GLOBALE
+set.seed(2026)
+
+df_imputed <- complete(imp_obj) %>%
+  # Rimuoviamo preventivamente chi non ha un treat_group ben definito
+  filter(!is.na(treat_group)) %>%
+  # Ordiniamo rigidamente per garantire sempre lo stesso output CSV
+  arrange(survivor_id, wave)
+
+outfile_csv <- file.path(PATH_OUT, "BaseDataset.csv")
+write_csv(df_imputed, outfile_csv)
+
+message(sprintf("[Export] Observational panel saved to: %s", outfile_csv))
+message("------------------------------------------------------------------------------")
+message("[Pipeline Pause] Execute the external Python generative routine (generate_data.py).")
+message("Resume this script once 'Augmented_v1_[MODEL].csv' is generated.")
+message("------------------------------------------------------------------------------")
+
+# ==============================================================================
+# BASELINE CHARACTERISTICS: PRE-TREATMENT COVARIATE BALANCE (TABLE 1)
+# ==============================================================================
+
+table1_data <- df_imputed %>%
+  mutate(
+    Treatment = ifelse(is_treated == 1, "Palliative Care", "Standard Care"),
+    Gender = factor(gender_imp, levels = c(1, 2), labels = c("Male", "Female")),
+    
+    `Cause of Death` = case_when(
+      cause_death == 1 ~ "Cancer",
+      cause_death %in% c(2, 3, 4) ~ "Cardiovascular",
+      cause_death == 5 ~ "Respiratory",
+      TRUE ~ "Other Causes"
+    ),
+    `Cause of Death` = factor(`Cause of Death`, levels = c("Cancer", "Cardiovascular", "Respiratory", "Other Causes")),
+    
+    Need_CP = ifelse(has_cancer == 1 | has_neuro == 1 | has_organ == 1, 1, 0),
+    Need_CP = factor(Need_CP, levels = c(0, 1), labels = c("No", "Yes"))
+  ) %>%
+  select(
+    Treatment,
+    `Age (Years)` = age_imp,
+    Gender,
+    `Education Level (ISCED 0-6)` = edu_imp, 
+    `Clinical Need for PC` = Need_CP,
+    `Cause of Death`,
+    `Self-Perceived Health (1-5)` = sphus_imp, 
+    `Baseline EURO-D (0-12)` = eurod_imp,
+    `ADL Score (0-6)` = adl_imp,
+    `Max Grip Strength (kg)` = maxgrip_imp,
+    `Log-Wealth` = wealth_log
+  )
+
+pacman::p_load(modelsummary, gt)
+
+baseline_table_gt <- datasummary_balance(
+  ~ Treatment, 
+  data = table1_data,
+  fmt = 2, 
+  output = "gt" 
+)
+
+baseline_table_final <- baseline_table_gt %>%
+  tab_options(
+    table.border.top.color = "black",
+    table.border.bottom.color = "black",
+    heading.title.font.weight = "bold"
+  )
+
+print(baseline_table_final)
+gtsave(baseline_table_final, file.path(PATH_OUT, "Table_1_Baseline_Characteristics.docx"))
+
+# ==============================================================================
+# STOP EXECUTING HERE IF RUNNING INTERACTIVELY.
+# RESUME AFTER PYTHON SCRIPT HAS GENERATED THE SYNTHETIC DATA.
+# ==============================================================================
+
+
+# ==============================================================================
+# 7. LOAD & VALIDATE AUGMENTED DATA (MULTIPLE IMPUTATION G-COMPUTATION)
+# ==============================================================================
+message("[Pipeline] Stage 5: Loading Multi-Imputed G-Computation Data")
+
+TARGET_MODEL <- "TTVAE" # Cambia in "CTGAN" o "TimeGAN" per analizzare i benchmark
+
+# Carichiamo l'unico file di G-Computation
+file_path <- file.path(PATH_OUT, paste0("Augmented_", TARGET_MODEL, "_GComp.csv"))
+
+if (!file.exists(file_path)) {
+  stop(sprintf("Dataset non trovato: %s", file_path))
+}
+
+df_raw <- read_csv(file_path, show_col_types = FALSE, na = c("", "NA", "-999", "-999.0"))
+
+if (!"wave" %in% names(df_raw)) {
+  df_raw <- df_raw %>% mutate(wave = wave_death + rel_time)
+}
+
+df_clean <- df_raw %>%
+  mutate(across(where(is.numeric), ~ ifelse(. <= -990, NA, .))) %>%
+  filter(!is.na(dep_score)) %>% 
+  mutate(
+    survivor_id = as.character(survivor_id),
+    wave        = as.numeric(wave),
+    rel_time    = wave - wave_death,
+    post        = ifelse(rel_time >= 0, 1, 0), 
+    dep_score   = as.numeric(dep_score),
+    treat_group = as.numeric(as.factor(treat_group)) - 1,
+    age         = as.numeric(age),
+    is_female   = as.numeric(is_female),
+    wealth_log  = as.numeric(wealth_log),
+    is_synthetic  = as.numeric(is_synthetic),
+    imputation_id = as.numeric(imputation_id)
+  ) %>%
+  arrange(imputation_id, survivor_id, wave)
+
+# Rinominiamo df_clean per compatibilità con il codice successivo
+list_aug_data <- list("GComp" = df_clean)
+
+message(sprintf("[Validation] Dataset G-Computation caricato con successo."))
+
+# ==============================================================================
+# 7.1 DIAGNOSTICA: Verifica del KS Score Statico
+# ==============================================================================
+message("[Diagnostics] Verifying Structural Skeleton Integrity (KS Score)...")
+df_check <- list_aug_data[["GComp"]] %>% filter(imputation_id == 1, rel_time == -1)
+
+real_skel <- df_check %>% filter(is_synthetic == 0)
+syn_skel  <- df_check %>% filter(is_synthetic == 1)
+
+if(nrow(real_skel) > 0 && nrow(syn_skel) > 0) {
+  ks_age <- ks.test(real_skel$age, syn_skel$age)$statistic
+  ks_wealth <- ks.test(real_skel$wealth_log, syn_skel$wealth_log)$statistic
+  
+  message(sprintf("   -> KS Distance Age: %.4f (Atteso: vicino a 0)", ks_age))
+  message(sprintf("   -> KS Distance Baseline Wealth: %.4f (Atteso: vicino a 0)", ks_wealth))
+  
+  if(ks_age < 0.05 && ks_wealth < 0.05) {
+    message("   ✅ SUCCESSO: La rete ha mantenuto il matching 1:1 perfetto.")
+  } else {
+    warning("   ⚠️ ATTENZIONE: Disallineamento sulle covariate di base!")
+  }
+}
+
+# ==============================================================================
+# 8. POST-AUGMENTATION DESCRIPTIVE STATISTICS (SYNTHETIC CLONES)
+# ==============================================================================
+message("[Pipeline] Stage 6: Generating Synthetic Baseline Summary")
+
+library(gtsummary)
+
+# Prendiamo il dataset G-Computation e isoliamo SOLO i dati sintetici della prima imputazione
+if ("GComp" %in% names(list_aug_data)) {
+  df_syn_table <- list_aug_data[["GComp"]] %>%
+    filter(is_synthetic == 1, imputation_id == 1) %>%
+    # Il baseline pre-trattamento per TUTTI i digital twins è t = -1
+    filter(rel_time == -1) %>%
+    distinct(survivor_id, treat_group, .keep_all = TRUE)
+  
+  if (nrow(df_syn_table) > 0) {
+    table_syn <- df_syn_table %>%
+      select(treat_group, age, is_female, dep_score, wealth_log) %>%
+      mutate(Group = factor(treat_group, levels = c(0, 1), labels = c("Synthetic Control", "Synthetic Treated"))) %>%
+      tbl_summary(
+        by = Group,
+        type = list(all_continuous() ~ "continuous"),
+        statistic = list(all_continuous() ~ "{mean} ({sd})", all_categorical() ~ "{n} ({p}%)"),
+        missing = "no"
+      ) %>%
+      add_p() %>% 
+      modify_header(label = "**Characteristic**") %>%
+      modify_caption("**Table S1. Baseline Characteristics of Synthetic Clones Only (G-Computation)**") %>%
+      bold_labels()
+    
+    gtsave(as_gt(table_syn), filename = file.path(PATH_OUT, "Table_S1_Synthetic_Baseline.docx"))
+    message("   -> Tabella dei cloni sintetici salvata con successo.")
+  }
+}
+
+# ==============================================================================
+# 9. ESTIMATION STRATEGY: DIRECT ATT VIA G-COMPUTATION
+# ==============================================================================
+message("[Pipeline] Stage 7: Causal Inference Modeling (Direct G-Computation ATT)")
+
+# Funzione per calcolare l'ATT diretto su una singola imputazione
+run_single_att <- function(df_m) {
+  
+  # 1. Identificare la coorte di interesse: i trattati reali (Palliative Care)
+  att_cohort <- df_m %>%
+    filter(is_synthetic == 0 & treat_group == 1) %>%
+    pull(survivor_id) %>% unique()
+  
+  # 2. Creare il dataset appaiato (Real vs Counterfactual) per t >= 0
+  df_paired <- df_m %>%
+    filter(survivor_id %in% att_cohort) %>%
+    filter(rel_time >= 0) %>% # Il passato è per definizione a delta zero
+    select(survivor_id, rel_time, is_synthetic, dep_score) %>%
+    pivot_wider(names_from = is_synthetic, values_from = dep_score, names_prefix = "syn_") %>%
+    rename(y_real = syn_0, y_syn = syn_1) %>%
+    mutate(att_delta = y_real - y_syn) %>%
+    filter(!is.na(att_delta))
+  
+  if(nrow(df_paired) == 0) return(NULL)
+  
+  # 3. Calcolo dell'Effetto Medio e Standard Error per ogni time point
+  res <- df_paired %>%
+    group_by(rel_time) %>%
+    summarise(
+      estimate = mean(att_delta),
+      std.error = sd(att_delta) / sqrt(n()), # Standard Error della media delle differenze
+      time_point = unique(rel_time),
+      term = paste0("t = ", time_point),
+      .groups = "drop"
+    )
+  
+  return(list(res = res, model = NULL)) 
+}
+
+# Funzione per applicare le Regole di Rubin ai risultati dell'ATT
+pool_rubins_att <- function(df_aug) {
+  M <- max(df_aug$imputation_id, na.rm = TRUE)
+  # Gradi di libertà per il t-test basati sul numero di cluster/pazienti unici
+  N_real_clusters <- length(unique(df_aug$survivor_id[df_aug$is_synthetic == 0 & df_aug$treat_group == 1]))
+  df_residuals <- N_real_clusters - 1 
+  
+  list_res <- list()
+  
+  for (m in 1:M) {
+    df_m <- df_aug %>% filter(imputation_id == m)
+    out <- run_single_att(df_m)
+    if (!is.null(out)) {
+      list_res[[m]] <- out$res
+    }
+  }
+  
+  list_res <- compact(list_res)
+  M_valid <- length(list_res)
+  if(M_valid == 0) return(NULL)
+  
+  df_all <- bind_rows(list_res, .id = "imp_m")
+  
+  pooled_results <- df_all %>%
+    group_by(term, time_point) %>%
+    summarise(
+      est_mean = mean(estimate),                    
+      V_within = mean(std.error^2, na.rm = TRUE),               
+      V_between = var(estimate),                    
+      V_total = V_within + (1 + 1/M_valid) * V_between, 
+      se_pooled = sqrt(V_total),                    
+      statistic = est_mean / se_pooled,             
+      p.value = 2 * pt(-abs(statistic), df = df_residuals), 
+      conf.low = est_mean - qt(0.975, df = df_residuals) * se_pooled,
+      conf.high = est_mean + qt(0.975, df = df_residuals) * se_pooled,
+      .groups = "drop"
+    ) %>% arrange(time_point)
+  
+  return(list(pooled = pooled_results))
+}
+
+# --- ESECUZIONE DEL POOLING ---
+message("[Estimation] Applying Rubin's Rules across Imputations...")
+rubin_results_list <- list()
+
+if ("GComp" %in% names(list_aug_data)) {
+  rubin_results_list[["GComp"]] <- pool_rubins_att(list_aug_data[["GComp"]])
+} else {
+  stop("Errore Critico: Dataset 'GComp' non trovato.")
+}
+
+# ==============================================================================
+# 10. PUBLICATION-READY OUTPUTS (MAIN ATT ESTIMATES)
+# ==============================================================================
+message("[Pipeline] Stage 8: Generating Main Tables and Dynamic ATT Figures")
+
+# 1. TABELLA: Mostriamo SOLO i periodi post-intervento (vera inferenza generativa)
+main_results_df <- rubin_results_list[["GComp"]]$pooled %>%
+  mutate(
+    Augmentation_Factor = "GComp",
+    Stars = case_when(p.value < 0.01 ~ "***", p.value < 0.05 ~ "**", p.value < 0.1 ~ "*", TRUE ~ ""),
+    Estimate_Formatted = paste0(sprintf("%.3f", est_mean), Stars, " (", sprintf("%.3f", se_pooled), ")"),
+    CI_95 = paste0("[", sprintf("%.3f", conf.low), ", ", sprintf("%.3f", conf.high), "]")
+  ) %>%
+  # IL FIX CHIRURGICO: Teniamo solo il post-trattamento
+  filter(time_point >= 0) 
+
+write_csv(main_results_df, file.path(PATH_OUT, paste0("Table_Main_ATT_", TARGET_MODEL, ".csv")))
+
+# 2. GRAFICO DELL'EFFETTO CAUSALE (Dynamic ATT)
+# Non è più un "Event-Study" classico, ma la pura stima dell'effetto nel tempo.
+p_att_plot <- ggplot(main_results_df, aes(x = as.factor(time_point), y = est_mean)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black", linewidth = 0.8) + 
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.15, linewidth = 0.8, color = "#2c3e50") +
+  geom_line(aes(group = 1), color = "#34495e", linewidth = 1, linetype = "dotted") +
+  # Usiamo un colore diverso per evidenziare che questa è la "Treatment Window"
+  geom_point(size = 4, shape = 21, fill = "#e74c3c", color = "#2c3e50", stroke = 1.2) +
+  scale_y_continuous(limits = function(x) c(min(x) - 0.5, max(x) + 0.5)) +
+  labs(
+    title = paste("Dynamic ATT via G-Computation:", TARGET_MODEL), 
+    subtitle = "Post-intervention causal effect on EURO-D Depression Score",
+    x = "Time Since Bereavement (Waves)", 
+    y = "Estimated ATT (Δ vs Synthetic Counterfactual)"
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    axis.text = element_text(color = "black")
+  )
+
+ggsave(file.path(PATH_OUT, paste0("Fig_Main_DynamicATT_", TARGET_MODEL, "_GComp.png")), p_att_plot, width = 8, height = 6, dpi = 300)
+
+message("✅ Main ATT Table and Plot successfully generated (Pre-treatment periods correctly omitted).")
+
+# ==============================================================================
+# 11. PRE-GENERATION DIAGNOSTICS (TWFE on RAW DATA)
+# ==============================================================================
+message("[Diagnostics] Executing TWFE Event-Study on RAW PRE-GENERATION data")
+
+# Testiamo il TWFE sui dati crudi per mostrare ai revisori che senza l'architettura
+# generativa i dati falliscono gravemente l'assunzione di parallel trends pre-trattamento.
+df_raw_test <- df_imputed %>% 
+  filter(rel_time >= -3 & rel_time <= 2) %>%
+  mutate(cluster_num = as.integer(as.factor(survivor_id)),
+         rel_time_factor = as.factor(rel_time))
+
+out_pre_model <- tryCatch({
+  feols(dep_score ~ treat_group + i(rel_time_factor, treat_group, ref = "-1") | 
+          cluster_num + rel_time_factor, 
+        data = df_raw_test, cluster = ~cluster_num)
+}, error = function(e) NULL)
+
+if(!is.null(out_pre_model)) {
+  # Estrazione dei coefficienti grezzi
+  res_raw <- broom::tidy(out_pre_model) %>%
+    filter(str_detect(term, "rel_time_factor::.*:treat_group")) %>%
+    mutate(time_point = as.numeric(str_extract(term, "-?\\d+")))
+  
+  p_pre_twfe <- ggplot(res_raw, aes(x = time_point, y = estimate)) +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    geom_vline(xintercept = -0.5, linetype = "dotted", color = "red") +
+    geom_errorbar(aes(ymin = estimate - 1.96*std.error, ymax = estimate + 1.96*std.error), width = 0.2) +
+    geom_line() + geom_point(size=3) +
+    theme_classic(base_size = 14) +
+    labs(title = "TWFE Event-Study on RAW Observational Data",
+         subtitle = "Note pre-treatment divergence (Failure of Parallel Trends)",
+         x = "Time Since Event (Waves)", y = "EURO-D Depression Score ATT")
+  
+  ggsave(file.path(PATH_OUT, "Fig_Diag_TWFE_Pre_Augmentation.png"), p_pre_twfe, width = 9, height = 6, dpi = 300)
+  message("✅ Pre-Generation TWFE plot successfully saved.")
+} else {
+  message("⚠️ TWFE sui dati crudi fallito per mancanza di varianza/supporto.")
+}
+
+# ==============================================================================
+# 12. APPENDICES & SENSITIVITY ANALYSES (SUBGROUPS WITH DIRECT ATT)
+# ==============================================================================
+message("[Pipeline] Stage 9: Executing Subgroup Analyses (G-Computation ATT)")
+
+PATH_APP <- file.path(PATH_OUT, "Appendices")
+if(!dir.exists(PATH_APP)) dir.create(PATH_APP)
+
+# Funzione aggiornata per chiamare il calcolo ATT invece del TWFE
+run_subgroup_att_rubin <- function(df_aug_full, filter_var, filter_val, group_name) {
+  
+  df_sub <- df_aug_full %>% filter(!!sym(filter_var) == filter_val)
+  
+  if(length(unique(df_sub$survivor_id[df_sub$is_synthetic == 0 & df_sub$treat_group == 1])) < 20) return(NULL)
+  
+  # Chiamiamo la nuova regola di Rubin per l'ATT
+  rubin_out <- tryCatch(pool_rubins_att(df_sub), error = function(e) NULL)
+  if(is.null(rubin_out) || is.null(rubin_out$pooled)) return(NULL)
+  
+  res_t0 <- rubin_out$pooled %>% filter(time_point == 0)
+  res_t1 <- rubin_out$pooled %>% filter(time_point == 1)
+  
+  tibble(
+    Subgroup = group_name,
+    `ATT t=0 (SE)` = sprintf("%.3f (%.3f)", res_t0$est_mean, res_t0$se_pooled),
+    `P-Value t=0` = round(res_t0$p.value, 3),
+    `ATT t=1 (SE)` = sprintf("%.3f (%.3f)", res_t1$est_mean, res_t1$se_pooled),
+    `P-Value t=1` = round(res_t1$p.value, 3)
+  )
+}
+
+df_full_gcomp <- list_aug_data[["GComp"]]
+
+# 1. Eterogeneità: Welfare
+df_full_gcomp <- df_full_gcomp %>% 
+  mutate(cntry = as.numeric(country), 
+         welfare_regime = case_when(cntry %in% c(13, 18, 55, 14) ~ "Nordic", 
+                                    cntry %in% c(11, 12, 17, 20, 23, 31) ~ "Continental", 
+                                    cntry %in% c(15, 16, 19, 33, 53, 59) ~ "Southern", 
+                                    cntry %in% c(28, 29, 34, 35, 47, 48, 32, 51, 57, 61, 63) ~ "Eastern", 
+                                    TRUE ~ NA_character_ ))
+
+res_welfare <- map_dfr(na.omit(unique(df_full_gcomp$welfare_regime)), 
+                       ~run_subgroup_att_rubin(df_full_gcomp, "welfare_regime", .x, .x))
+
+if(nrow(res_welfare)>0) {
+  write_csv(res_welfare, file.path(PATH_APP, "Table_App_Welfare_ATT.csv"))
+  gtsave(gt(res_welfare) %>% tab_header(title = "G-Computation ATT Heterogeneity: Welfare Regime"), file.path(PATH_APP, "Table_App_Welfare_ATT.docx"))
+}
+
+# 2. Eterogeneità: Gender
+res_gender <- map_dfr(c(0, 1), ~run_subgroup_att_rubin(df_full_gcomp, "is_female", .x, ifelse(.x==1, "Female", "Male")))
+if(nrow(res_gender)>0) {
+  write_csv(res_gender, file.path(PATH_APP, "Table_App_Gender_ATT.csv"))
+  gtsave(gt(res_gender) %>% tab_header(title = "G-Computation ATT Heterogeneity: Gender"), file.path(PATH_APP, "Table_App_Gender_ATT.docx"))
+}
+
+message("[Pipeline] G-Computation Analytical routines successfully terminated.")
+
+# ==============================================================================
+# 12.b HETEROGENEOUS TREATMENT EFFECTS (HTE) VISUALIZATIONS
+# ==============================================================================
+message("[Pipeline] Generating HTE Plots for Appendices...")
+
+# Helper function per estrarre il dataframe completo del pooled ATT per i plot
+get_subgroup_plot_data <- function(df_aug_full, filter_var, filter_val, group_name) {
+  df_sub <- df_aug_full %>% filter(!!sym(filter_var) == filter_val)
+  if(length(unique(df_sub$survivor_id[df_sub$is_synthetic == 0 & df_sub$treat_group == 1])) < 20) return(NULL)
+  
+  rubin_out <- tryCatch(pool_rubins_att(df_sub), error = function(e) NULL)
+  if(is.null(rubin_out) || is.null(rubin_out$pooled)) return(NULL)
+  
+  rubin_out$pooled %>%
+    filter(time_point >= 0 & time_point <= 2) %>% # Teniamo t=0, 1, 2
+    mutate(Subgroup = group_name)
+}
+
+# --- 1. PLOT ETEROGENEITÀ PER GENERE ---
+df_gender_plot <- bind_rows(
+  get_subgroup_plot_data(df_full_gcomp, "is_female", 0, "Male"),
+  get_subgroup_plot_data(df_full_gcomp, "is_female", 1, "Female")
+)
+
+if(nrow(df_gender_plot) > 0) {
+  p_gender <- ggplot(df_gender_plot, aes(x = as.factor(time_point), y = est_mean, color = Subgroup, group = Subgroup)) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "black", linewidth = 0.8) +
+    # Usiamo position_dodge per non sovrapporre le barre di errore
+    geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.2, linewidth = 0.8, position = position_dodge(0.3)) +
+    geom_line(linewidth = 1, position = position_dodge(0.3)) +
+    geom_point(size = 3, shape = 21, fill = "white", stroke = 1.2, position = position_dodge(0.3)) +
+    scale_color_manual(values = c("Male" = "#2980b9", "Female" = "#c0392b")) +
+    labs(
+      title = "Heterogeneous Treatment Effects by Gender",
+      subtitle = "Dynamic ATT on EURO-D Depression Score",
+      x = "Time Since Bereavement (Waves)", 
+      y = "Estimated ATT",
+      color = "Gender"
+    ) +
+    theme_classic(base_size = 14) + theme(legend.position = "bottom")
+  
+  ggsave(file.path(PATH_APP, "Fig_App_Gender_HTE.png"), p_gender, width = 8, height = 6, dpi = 300)
+}
+
+# --- 2. PLOT ETEROGENEITÀ PER WELFARE REGIME ---
+df_welfare_plot <- map_dfr(na.omit(unique(df_full_gcomp$welfare_regime)), 
+                           ~get_subgroup_plot_data(df_full_gcomp, "welfare_regime", .x, .x))
+
+if(nrow(df_welfare_plot) > 0) {
+  p_welfare <- ggplot(df_welfare_plot, aes(x = as.factor(time_point), y = est_mean, color = Subgroup, group = Subgroup)) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "black", linewidth = 0.8) +
+    geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.2, linewidth = 0.8, position = position_dodge(0.4)) +
+    geom_line(linewidth = 1, position = position_dodge(0.4)) +
+    geom_point(size = 3, shape = 21, fill = "white", stroke = 1.2, position = position_dodge(0.4)) +
+    scale_color_manual(values = c("Nordic" = "#27ae60", "Continental" = "#f39c12", "Southern" = "#8e44ad", "Eastern" = "#d35400")) +
+    labs(
+      title = "Heterogeneous Treatment Effects by Welfare Regime",
+      subtitle = "Dynamic ATT on EURO-D Depression Score",
+      x = "Time Since Bereavement (Waves)", 
+      y = "Estimated ATT",
+      color = "Welfare Regime"
+    ) +
+    theme_classic(base_size = 14) + theme(legend.position = "bottom")
+  
+  ggsave(file.path(PATH_APP, "Fig_App_Welfare_HTE.png"), p_welfare, width = 9, height = 6, dpi = 300)
+}
+message("✅ HTE Plots successfully saved to Appendices folder.")
+
+# ==============================================================================
+# EMPIRICAL CHECK: ETEROGENEITÀ SUI DATI ORIGINALI (RAW DATA)
+# ==============================================================================
+
+# 1. Prepariamo i dati (assicuriamoci che welfare_regime esista)
+setwd("/Users/pietro/Desktop/Sant'Anna/Ricerca/SHARE/DiDRev2")
+df_emp <- read.csv("BaseDataset.csv")
+
+df_emp$welfare_regime <- case_when(
+  df_emp$country %in% c(13, 18, 55, 14) ~ "Nordic", 
+  df_emp$country %in% c(11, 12, 17, 20, 23, 31) ~ "Continental", 
+  df_emp$country %in% c(15, 16, 19, 33, 53, 59) ~ "Southern", 
+  df_emp$country %in% c(28, 29, 34, 35, 47, 48, 32, 51, 57, 61, 63) ~ "Eastern", 
+  TRUE ~ NA_character_
+)
+
+# 2. HTE per Genere (is_female: 0 = Male, 1 = Female)
+mod_gender <- feols(dep_score ~ i(rel_time, treat_group, ref = "-1") | 
+                      survivor_id + rel_time, 
+                    data = df_emp, split = ~is_female, cluster = ~survivor_id)
+
+message("--- EFFETTO CAUSALE EMPIRICO PER GENERE ---")
+etable(mod_gender)
+
+
+# 3. HTE per Welfare Regime
+mod_welfare <- feols(dep_score ~ i(rel_time, treat_group, ref = "-1") | 
+                       survivor_id + rel_time, 
+                     data = df_emp, split = ~welfare_regime, cluster = ~survivor_id)
+
+message("--- EFFETTO CAUSALE EMPIRICO PER WELFARE REGIME ---")
+etable(mod_welfare)
+
+# ==============================================================================
+# 13. SENSITIVITY ANALYSIS: DEEP LATENT PERTURBATION
+# ==============================================================================
+message("[Sensitivity] Analyzing Robustness via Deep Latent Space Perturbation...")
+
+stress_file <- file.path(PATH_OUT, "Augmented_TTVAE_StressTest.csv")
+
+if (file.exists(stress_file)) {
+  # Carichiamo i dati avvelenati
+  df_stress_raw <- read_csv(stress_file, show_col_types = FALSE, na = c("", "NA", "-999", "-999.0"))
+  
+  df_stress_clean <- df_stress_raw %>%
+    filter(!is.na(dep_score)) %>% 
+    mutate(
+      survivor_id = as.character(survivor_id),
+      wave        = as.numeric(wave),
+      rel_time    = wave - wave_death,
+      treat_group = as.numeric(as.factor(treat_group)) - 1,
+      is_synthetic  = as.numeric(is_synthetic),
+      imputation_id = as.numeric(imputation_id)
+    )
+  
+  # Applichiamo Rubin's Rules per calcolare l'ATT sul dataset avvelenato
+  rubin_stress <- pool_rubins_att(df_stress_clean)
+  
+  message("--- ATT Post-Intervention (Poisoned Dataset: Gamma Latent Shift = 0.5) ---")
+  stress_results <- rubin_stress$pooled %>% 
+    filter(time_point >= 0) %>% 
+    select(term, est_mean, se_pooled, p.value)
+  
+  print(stress_results)
+  
+  # Export dei risultati dello Stress Test
+  write_csv(stress_results, file.path(PATH_OUT, "Table_App_StressTest_ATT.csv"))
+  message("✅ Sensitivity Analysis completata. Tabella salvata per l'appendice.")
+  
+} else {
+  message("⚠️ File StressTest non trovato. Lancia lo script Python aggiornato.")
+}
